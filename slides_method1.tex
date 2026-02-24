@@ -1,0 +1,368 @@
+\documentclass[aspectratio=169]{beamer}
+\usetheme{Madrid}
+\usecolortheme{default}
+
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usepackage{colortbl}
+
+% ── Colors matching Deep-Generative-Models1.pptx template ──
+\definecolor{accentpink}{RGB}{215,58,215}   % D73AD7 - title/accent
+\definecolor{darktext}{RGB}{39,37,37}       % 272525 - body text
+\definecolor{accentgreen}{RGB}{34,139,34}
+\definecolor{accentred}{RGB}{200,50,50}
+\definecolor{highlightbg}{RGB}{245,230,245} % light pink for table highlight
+
+% ── Apply template colors to beamer ──
+\setbeamercolor{structure}{fg=accentpink}
+\setbeamercolor{frametitle}{fg=accentpink, bg=white}
+\setbeamercolor{title}{fg=accentpink}
+\setbeamercolor{subtitle}{fg=darktext}
+\setbeamercolor{normal text}{fg=darktext}
+\setbeamercolor{block title}{bg=accentpink!15, fg=accentpink}
+\setbeamercolor{block body}{bg=accentpink!5}
+\setbeamercolor{itemize item}{fg=accentpink}
+\setbeamercolor{itemize subitem}{fg=accentpink}
+
+% ── Hide navigation symbols (bottom controls) ──
+\setbeamertemplate{navigation symbols}{}
+
+% ── Fonts: use sans-serif to approximate Source Sans / Source Serif ──
+\setbeamerfont{frametitle}{series=\bfseries, size=\Large}
+\setbeamerfont{title}{series=\bfseries, size=\huge}
+
+\title{Early-Step Diversity Guidance}
+\subtitle{Training-Free Diversity Recovery for Aligned Diffusion Models}
+\author{Matin Mohammad Ghasemi, Mahdi Kamran, Mohammad Zare}
+\institute{Sharif University of Technology}
+\date{}
+
+\begin{document}
+
+% ─────────────────────────────────────────────────────────
+\begin{frame}
+\titlepage
+\end{frame}
+
+% ═════════════════════════════════════════════════════════
+% PART I: MOTIVATION
+% ═════════════════════════════════════════════════════════
+
+\begin{frame}{The Alignment--Diversity Tradeoff}
+\begin{columns}
+\begin{column}{0.55\textwidth}
+\textbf{Problem:} Fine-tuned diffusion models (e.g., DreamShaper-8) produce high-quality, well-aligned images but suffer from \textcolor{accentred}{severe mode collapse}.
+
+\vspace{0.3cm}
+\textbf{Observation:}
+\begin{itemize}
+    \item Base Model (SD v1.5): \textcolor{accentgreen}{high diversity}, low alignment
+    \item Fine-Tuned Model: \textcolor{accentred}{low diversity}, high alignment
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{Goal:} Recover diversity at inference time \textit{without retraining}, while preserving alignment.
+\end{column}
+\begin{column}{0.42\textwidth}
+\begin{block}{Formal Tradeoff}
+\small
+Alignment optimization reshapes $p_\theta(\mathbf{x}|c)$ to concentrate on high-reward regions:
+$$p_\theta^*(\mathbf{x}|c) \propto p_{\text{ref}}(\mathbf{x}|c) \cdot e^{r(\mathbf{x},c)/\lambda}$$
+\begin{itemize}
+    \item $\lambda \to 0$: max alignment, zero diversity
+    \item $\lambda \to \infty$: full diversity, no alignment gain
+\end{itemize}
+\end{block}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ═════════════════════════════════════════════════════════
+% PART II: METHOD
+% ═════════════════════════════════════════════════════════
+
+\begin{frame}{Method Overview: Early-Step Diversity Guidance}
+\begin{block}{Key Idea}
+Compute a \textbf{structural pairwise similarity loss} over a batch of latent samples and apply the resulting gradient to \textbf{steer trajectories apart} during the critical early denoising steps.
+\end{block}
+
+\vspace{0.3cm}
+\textbf{Three-phase framework:}
+\begin{enumerate}
+    \item \textbf{Phase 1: Diversity Domain Selection} --- Choose where to compute diversity (latent $\mathbf{x}_t$ or clean estimate $\hat{\mathbf{x}}_0$)
+    \item \textbf{Phase 2: Structural Diversity Loss} --- Pairwise cosine similarity on avg-pooled representations
+    \item \textbf{Phase 3: Early-Step Gradient Steering} --- Apply diversity gradient only during the first $k$ fraction of steps
+\end{enumerate}
+
+\vspace{0.3cm}
+\textbf{Two variants:}
+\begin{itemize}
+    \item \textcolor{accentpink}{\textbf{Latent-Space Guidance}} (primary): operates directly on $\mathbf{x}_t$
+    \item Clean-Manifold Guidance (CMDG): operates on Tweedie estimate $\hat{\mathbf{x}}_0$
+\end{itemize}
+\end{frame}
+
+% ─────────────────────────────────────────────────────────
+
+\begin{frame}{Phase 1: Diversity Domain Selection}
+\begin{columns}
+\begin{column}{0.48\textwidth}
+\textbf{\textcolor{accentpink}{Latent-Space Domain (Primary)}}
+\begin{itemize}
+    \item Compute diversity loss directly on $\mathbf{x}_t$
+    \item Simple and efficient --- no extra computation
+    \item Structural pooling (Phase 2) mitigates noise
+    \item Best diversity--alignment balance
+\end{itemize}
+\end{column}
+\begin{column}{0.48\textwidth}
+\textbf{Clean-Manifold Domain (Variant)}
+\begin{itemize}
+    \item Estimate clean image via Tweedie's formula:
+\end{itemize}
+$$\hat{\mathbf{x}}_0 = \frac{\mathbf{x}_t - \sqrt{1-\bar{\alpha}_t}\,\boldsymbol{\epsilon}_\theta}{\sqrt{\bar{\alpha}_t}}$$
+\begin{itemize}
+    \item Semantically richer signal
+    \item Tends to \textcolor{accentred}{over-steer} samples, degrading alignment and quality
+\end{itemize}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ─────────────────────────────────────────────────────────
+
+\begin{frame}{Phase 2: Structural Diversity Loss}
+
+Given batch of $B$ representations $\{\mathbf{z}^{(i)}\}_{i=1}^{B}$:
+
+\vspace{0.2cm}
+\textbf{Step 1:} Average-pool to $8 \times 8$, flatten, and $\ell_2$-normalize:
+$$\mathbf{f}^{(i)} = \text{flatten}\!\left(\text{AvgPool}_{8\times 8}(\mathbf{z}^{(i)})\right), \quad \bar{\mathbf{f}}^{(i)} = \frac{\mathbf{f}^{(i)}}{\|\mathbf{f}^{(i)}\|_2}$$
+
+\textbf{Step 2:} Pairwise cosine similarity loss:
+$$\mathcal{L}_{\text{div}} = \frac{1}{B(B-1)} \sum_{i \neq j} \bar{\mathbf{f}}^{(i)} \cdot \bar{\mathbf{f}}^{(j)}$$
+
+\textbf{Step 3:} Compute and normalize gradient:
+$$\mathbf{g} = \nabla_{\mathbf{z}} \mathcal{L}_{\text{div}}, \qquad \mathbf{g} \leftarrow \mathbf{g}\, /\, \|\mathbf{g}\|_{\text{batch}}$$
+
+\vspace{0.2cm}
+\begin{block}{Why $8 \times 8$ pooling?}
+Captures \textbf{compositional structure} (viewpoint, object placement, layout) while abstracting away pixel-level noise.
+\end{block}
+\end{frame}
+
+% ─────────────────────────────────────────────────────────
+
+\begin{frame}{Phase 3: Early-Step Gradient Steering}
+
+\textbf{After} standard CFG denoising step, apply corrective perturbation:
+$$\mathbf{x}_{t-1} \leftarrow \mathbf{x}_{t-1} - \lambda_{\text{div}} \cdot w_t \cdot \mathbf{g}$$
+
+\vspace{0.3cm}
+\begin{columns}
+\begin{column}{0.48\textwidth}
+\textbf{Early-Stop Ratio ($k$):}
+\begin{itemize}
+    \item Only guide the first $k$ fraction of steps
+    \item $k = 0.3$ (first 30\% of 50 steps = 15 steps)
+    \item Early steps $\to$ global structure
+    \item Later steps $\to$ textures \& details
+\end{itemize}
+\end{column}
+\begin{column}{0.48\textwidth}
+\textbf{Temporal Weight Schedules:}
+\begin{itemize}
+    \item \textbf{Constant:} $w_t = 1$ \textcolor{accentgreen}{(best)}
+    \item Linear decay: $w_t = 1 - t/k$
+    \item Cosine decay: $w_t = \frac{1}{2}(1+\cos(\pi t/k))$
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{Hyperparameters:}
+\begin{itemize}
+    \item $\lambda_{\text{div}} = 10$ (latent-space)
+    \item $\lambda_{\text{div}} = 5$ (clean-manifold)
+\end{itemize}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ═════════════════════════════════════════════════════════
+% PART III: EXPERIMENTS
+% ═════════════════════════════════════════════════════════
+
+\begin{frame}{Experimental Setup}
+\begin{columns}
+\begin{column}{0.48\textwidth}
+\textbf{Models:}
+\begin{itemize}
+    \item \textbf{Base:} Stable Diffusion v1.5, $w=3.5$
+    \item \textbf{Fine-Tuned:} DreamShaper-8, $w=7.5$
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{Sampling:}
+\begin{itemize}
+    \item DDIM, $T=50$ steps
+    \item Batch size $B=4$, fixed seeds
+    \item 43 evaluation prompts
+\end{itemize}
+\end{column}
+\begin{column}{0.48\textwidth}
+\textbf{Metrics:}
+\begin{itemize}
+    \item \textbf{LPIPS} $\uparrow$ --- intra-batch perceptual diversity
+    \item \textbf{CLIP Score} $\uparrow$ --- text-image alignment
+    \item \textbf{CLIP Diversity} $\uparrow$ --- feature-space diversity
+    \item \textbf{ImageReward} $\uparrow$ --- human preference
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{Four configurations:}
+\begin{enumerate}
+    \item Base Model baseline
+    \item Fine-Tuned baseline
+    \item \textcolor{accentpink}{\textbf{Latent-Space Guidance (ours)}}
+    \item Clean-Manifold / CMDG (ours)
+\end{enumerate}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ═════════════════════════════════════════════════════════
+% PART IV: RESULTS
+% ═════════════════════════════════════════════════════════
+
+\begin{frame}{Quantitative Results (43 Prompts)}
+
+\begin{table}
+\centering
+\small
+\begin{tabular}{l c c c c}
+\toprule
+\textbf{Method} & \textbf{LPIPS $\uparrow$} & \textbf{CLIP Score $\uparrow$} & \textbf{CLIP Div.\ $\uparrow$} & \textbf{ImgReward $\uparrow$} \\
+\midrule
+Base Model (SD v1.5)       & 0.675 & 0.317 & 0.159 & 0.431 \\
+Fine-Tuned (DreamShaper-8) & 0.563 & 0.321 & 0.089 & 1.022 \\
+\rowcolor{highlightbg}
+\textbf{Latent-Space (ours)} & \textbf{0.653} & \textbf{0.322} & 0.108 & \textbf{0.851} \\
+CMDG (ours)   & 0.753 & 0.318 & 0.136 & 0.665 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\vspace{0.3cm}
+\textbf{Key findings for Latent-Space Guidance:}
+\begin{itemize}
+    \item Recovers \textbf{80\%} of the diversity gap to the Base Model (LPIPS: $0.563 \to 0.653$)
+    \item \textbf{Highest CLIP Score} of all methods ($0.322$) --- alignment fully preserved
+    \item Retains \textbf{83\%} of Fine-Tuned ImageReward ($0.851$ vs.\ $1.022$)
+    \item CMDG achieves higher raw diversity but with \textcolor{accentred}{35\% ImageReward drop}
+\end{itemize}
+\end{frame}
+
+% ─────────────────────────────────────────────────────────
+
+\begin{frame}{Qualitative Results: ``A beautiful cinematic shark''}
+\begin{columns}
+\begin{column}{0.55\textwidth}
+\includegraphics[width=\textwidth]{method1-shark.png}
+\end{column}
+\begin{column}{0.42\textwidth}
+\textbf{LPIPS scores:}
+\begin{itemize}
+    \item Base Model: $0.741$
+    \item Fine-Tuned: $0.575$ \textcolor{accentred}{(collapsed)}
+    \item \textcolor{accentpink}{\textbf{Latent-Space: $0.714$}}
+    \item CMDG: $0.808$
+\end{itemize}
+
+\vspace{0.3cm}
+Our latent-space guidance generates \textbf{diverse underwater scenes}, camera angles, and shark poses while \textbf{preserving cinematic quality}.
+
+\vspace{0.2cm}
+Fine-Tuned baseline repeats the same shark profile, water hue, and lighting across all seeds.
+\end{column}
+\end{columns}
+\end{frame}
+
+% ─────────────────────────────────────────────────────────
+
+\begin{frame}{Qualitative Results: ``A majestic knight in a mystical forest''}
+\begin{columns}
+\begin{column}{0.55\textwidth}
+\includegraphics[width=\textwidth]{method1-knight.png}
+\end{column}
+\begin{column}{0.42\textwidth}
+\textbf{LPIPS scores:}
+\begin{itemize}
+    \item Base Model: $0.667$
+    \item Fine-Tuned: $0.441$ \textcolor{accentred}{(collapsed)}
+    \item \textcolor{accentpink}{\textbf{Latent-Space: $0.577$}}
+    \item CMDG: $0.744$
+\end{itemize}
+
+\vspace{0.3cm}
+Latent-space guidance recovers \textbf{diverse forest geometries} and knight stances.
+
+\vspace{0.2cm}
+Maintains Fine-Tuned \textbf{texture fidelity} (CLIP: $0.360$ vs.\ $0.326$ for Base).
+\end{column}
+\end{columns}
+\end{frame}
+
+% ─────────────────────────────────────────────────────────
+
+\begin{frame}{Qualitative Results: ``A cartoonlike village full of trees and houses''}
+\begin{columns}
+\begin{column}{0.55\textwidth}
+\includegraphics[width=\textwidth]{method1-houses.png}
+\end{column}
+\begin{column}{0.42\textwidth}
+\textbf{LPIPS scores:}
+\begin{itemize}
+    \item Base Model: $0.671$
+    \item Fine-Tuned: $0.495$ \textcolor{accentred}{(collapsed)}
+    \item \textcolor{accentpink}{\textbf{Latent-Space: $0.525$}}
+    \item CMDG: $0.776$
+\end{itemize}
+
+\vspace{0.3cm}
+Latent-space guidance introduces \textbf{varied village topographies} and road layouts.
+
+\vspace{0.2cm}
+Retains the vibrant \textbf{cartoon-like aesthetic} of the Fine-Tuned model.
+\end{column}
+\end{columns}
+\end{frame}
+
+% ═════════════════════════════════════════════════════════
+% SUMMARY
+% ═════════════════════════════════════════════════════════
+
+\begin{frame}{Summary}
+
+\begin{block}{Early-Step Diversity Guidance}
+A \textbf{training-free}, inference-time method that steers batch samples apart via structural repulsion gradients during early denoising steps.
+\end{block}
+
+\vspace{0.3cm}
+\textbf{Main contributions:}
+\begin{itemize}
+    \item \textbf{Latent-Space Guidance} achieves the best diversity--alignment balance:
+    \begin{itemize}
+        \item[$\circ$] \textbf{+16\%} LPIPS diversity over Fine-Tuned baseline
+        \item[$\circ$] \textbf{Highest} CLIP Score among all methods
+        \item[$\circ$] \textbf{83\%} ImageReward retention
+    \end{itemize}
+    \item Structural pooling ($8\times 8$) focuses repulsion on composition, not texture
+    \item Early-stop ($k=0.3$) preserves fine-grained quality in later steps
+\end{itemize}
+
+\vspace{0.3cm}
+\textbf{Takeaway:} Simple latent-space diversity guidance, restricted to early steps, provides the most \textbf{practical} operating point on the alignment--diversity Pareto frontier.
+\end{frame}
+
+\end{document}
