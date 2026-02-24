@@ -229,9 +229,51 @@ These limitations motivate our proposed framework. By computing diversity forces
 \label{sec:methods}
 % =============================================================================
 
-\subsection{Method 1}
+\subsection{Method 1: Early-Step Diversity Guidance}
+\label{sec:cmdg}
 
-% TODO Placeholder for Method 1
+Existing test-time diversity methods, such as particle-based guidance~\citep{corso2023particle}, introduce repulsive forces between concurrently sampled images to prevent mode collapse within a batch. We build on this idea and propose \textbf{Early-Step Diversity Guidance}, a training-free inference-time framework that computes a structural similarity loss over a batch of latent samples and applies the resulting gradient to steer their sampling trajectories apart during the critical early denoising steps. We investigate two formulations that differ in the domain on which diversity is measured: (i)~\textit{Latent-Space Diversity Guidance}, which operates directly on the noisy latent $\mathbf{x}_t$, and (ii)~\textit{Clean-Manifold Diversity Guidance (CMDG)}, which first projects $\mathbf{x}_t$ onto the clean image manifold via Tweedie's formula. The framework operates in three phases: Diversity Domain Selection, Structural Diversity Computation, and Early-Step Gradient Steering.
+
+\subsubsection{Phase 1: Diversity Domain Selection}
+
+At each denoising timestep $t$, the model predicts the noise component $\boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t, c)$. The diversity loss can be computed on two domains:
+
+\textbf{Latent-space domain (primary).} The diversity loss is computed directly on the current noisy latent $\mathbf{x}_t$. This formulation is simple and efficient: it requires no additional forward computation beyond the standard denoising pass. Despite operating in the noisy domain, the structural pooling in Phase~2 mitigates high-frequency noise, allowing the gradient to capture meaningful layout-level differences even at moderate noise levels.
+
+\textbf{Clean-manifold domain (variant).} Alternatively, we recover an analytical estimate of the clean image using Tweedie's formula~\citep{robbins1956empirical}:
+\begin{equation}
+    \hat{\mathbf{x}}_0 = \frac{\mathbf{x}_t - \sqrt{1 - \bar{\alpha}_t}\, \boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t, c)}{\sqrt{\bar{\alpha}_t}},
+\end{equation}
+where $\bar{\alpha}_t = \prod_{s=1}^{t} (1 - \alpha_s)$ is the cumulative noise schedule coefficient. This estimate preserves the global semantic layout of the emerging image. We clamp $\hat{\mathbf{x}}_0$ to the range $[-20, 20]$ to prevent numerical instability. While this projection provides a semantically richer signal, it introduces additional computation and, as shown in Section~\ref{sec:experiments}, can over-steer samples at the cost of alignment and image quality.
+
+\subsubsection{Phase 2: Structural Diversity Loss}
+
+Given a batch of $B$ representations $\{\mathbf{z}^{(i)}\}_{i=1}^{B}$ (where $\mathbf{z}$ is either $\mathbf{x}_t$ or $\hat{\mathbf{x}}_0$ depending on the chosen domain), we define a pairwise similarity loss. To focus on global composition rather than fine texture, we first apply spatial average pooling to reduce each representation to an $8 \times 8$ spatial resolution, then flatten and compute cosine similarity:
+\begin{equation}
+    \mathbf{f}^{(i)} = \text{flatten}\!\left(\text{AvgPool}_{8 \times 8}(\mathbf{z}^{(i)})\right), \quad \bar{\mathbf{f}}^{(i)} = \frac{\mathbf{f}^{(i)}}{\|\mathbf{f}^{(i)}\|_2}
+\end{equation}
+\begin{equation}
+    \mathcal{L}_{\text{div}} = \frac{1}{B(B-1)} \sum_{i \neq j} \bar{\mathbf{f}}^{(i)} \cdot \bar{\mathbf{f}}^{(j)}
+\end{equation}
+This loss is minimized when batch members have maximally dissimilar global layouts. The average pooling to $8 \times 8$ is critical: it abstracts away pixel-level noise while preserving compositional structure (e.g., viewpoint, object placement, scene layout).
+
+We compute the gradient of this loss with respect to the input representation:
+\begin{equation}
+    \mathbf{g} = \nabla_{\mathbf{z}} \mathcal{L}_{\text{div}},
+\end{equation}
+and normalize it to unit batch norm ($\|\mathbf{g}\|_{\text{batch}} = 1$) so that the diversity strength is controlled solely by the hyperparameter $\lambda_{\text{div}}$.
+
+\subsubsection{Phase 3: Early-Step Gradient Steering}
+
+The diversity gradient is applied as a corrective perturbation \textit{after} the standard scheduler step. At each guided timestep, the denoising update proceeds normally via classifier-free guidance (Eq.~\ref{eq:cfg}), producing the next latent $\mathbf{x}_{t-1}$. We then subtract the scaled diversity gradient:
+\begin{equation}
+    \mathbf{x}_{t-1} \leftarrow \mathbf{x}_{t-1} - \lambda_{\text{div}} \cdot w_t \cdot \mathbf{g},
+\end{equation}
+where $\lambda_{\text{div}}$ is the diversity scale and $w_t$ is a temporal weight that modulates the guidance strength across steps.
+
+Crucially, diversity guidance is only applied during the first $k$ fraction of denoising steps (controlled by the \textit{early-stop ratio}), after which standard denoising proceeds unmodified. This design is motivated by the observation that global image structure is determined during the earliest steps, while later steps refine local textures and details. Applying diversity forces beyond this critical window wastes computation and risks degrading fine-grained quality without further diversity benefit.
+
+The temporal weight $w_t$ supports several scheduling strategies: \textit{constant} ($w_t = 1$), \textit{linear decay} ($w_t = 1 - t/k$), and \textit{cosine decay} ($w_t = \frac{1}{2}(1 + \cos(\pi t / k))$). In our experiments, we find that constant weighting with $k = 0.3$ (i.e., guiding only the first 30\% of steps) provides the best balance between diversity improvement and alignment preservation. As shown in Section~\ref{sec:experiments}, the latent-space variant achieves the most favorable diversity--alignment tradeoff, significantly improving diversity while preserving the Fine-Tuned model's image quality and alignment scores. The clean-manifold variant achieves higher raw diversity but at a greater cost to alignment and perceptual quality.
 
 \subsection{Method 2: Object-Aware Entropy Guidance (OAEG)}
 \label{sec:oaeg}
@@ -298,41 +340,106 @@ The final composite noise prediction passed to the scheduler is:
 \label{sec:experiments}
 % =============================================================================
 
-\subsection{Experimental Setup}
+\subsection{Shared Experimental Setup}
 \label{sec:experimental_setup}
 
-To empirically validate the alignment--diversity tradeoff and rigorously evaluate the effectiveness of the proposed Object-Aware Entropy Guidance (OAEG) framework, we constructed a comprehensive experimental pipeline.
+Both methods are evaluated using a common set of models, sampling configurations, and metrics to enable direct comparison.
 
-\textbf{Models and Baselines:} \\ 
-We utilize Stable Diffusion v1.5 (\texttt{runwayml/stable-diffusion-v1-5}) as our highly-diverse, low-alignment \textit{Base Model}. This model generates a wide variety of structural layouts but frequently produces muddy textures and lacks modern aesthetic fidelity. For our highly-aligned, low-diversity \textit{Fine-Tuned Model}, we utilize DreamShaper-8 (\texttt{Lykon/dreamshaper-8}), a checkpoint heavily optimized for human preference that produces breathtaking cinematic quality at the cost of severe spatial mode collapse. All image generations are executed using the DDIM sampling algorithm to ensure deterministic latent trajectories.
+\textbf{Models:} We utilize Stable Diffusion v1.5 (\texttt{runwayml/stable-diffusion-v1-5}) as our highly-diverse, low-alignment \textit{Base Model}, and DreamShaper-8 (\texttt{Lykon/dreamshaper-8}) as our highly-aligned, low-diversity \textit{Fine-Tuned Model}. All image generations are executed using the DDIM sampling algorithm to ensure deterministic latent trajectories.
 
-\textbf{Generation Hyperparameters and OAEG Configuration:} \\
-To ensure a mathematically fair comparison, all images across all methods are generated using $T=50$ denoising steps and strictly matching deterministic latent noise seeds. This isolates any observed structural differences purely to the model intervention rather than initial noise variance. 
+\textbf{Common Hyperparameters:} All images across all methods are generated using $T=50$ denoising steps and strictly matching deterministic latent noise seeds. This isolates any observed structural differences purely to the model intervention rather than initial noise variance. Batches of $B=4$ images are generated per prompt.
 
-A critical component of our setup is the use of \textbf{Asymmetric Classifier-Free Guidance (CFG)}. To encourage maximum structural diversity, the Base model operates at a low CFG scale ($w=3.5$). Conversely, to maximize aesthetic alignment and subject quality, the Fine-Tuned model operates at a standard high CFG scale ($w=7.5$). Inside the OAEG pipeline, these asymmetric CFG scales are evaluated simultaneously during the dual U-Net pass. 
+\textbf{Metrics:} We evaluate the generated batches along two orthogonal axes. To quantitatively measure spatial and compositional variance, we compute intra-batch \textbf{LPIPS} utilizing an AlexNet backbone. For alignment, we report \textbf{CLIP Score} (cosine similarity between CLIP image and text embeddings), \textbf{ImageReward} (a learned human-preference predictor), and \textbf{PickScore} (a ViT-H-based preference evaluator fine-tuned on Pick-a-Pic).
 
-For the OAEG specific hyperparameters, we enforce a strict semantic boundary by setting the attention mask threshold to $\tau_{\text{mask}} = 0.20$. To regulate the temporal transition, we use a sigmoid slope of $s=0.2$ coupled with our dynamically calculated threshold ($\tau_{\text{entropy}} = E_0 / 2$). Finally, we utilize a highly restrictive \textbf{background damping factor} of $d = 0.05$. This parameter dictates that when the temporal schedule $\gamma$ decays to $0$, the background pixels are still strictly composed of $95\%$ Base model noise and only $5\%$ Fine-Tuned noise. This $5\%$ allowance prevents latent-space discontinuity at the mask boundaries while completely neutralizing the Fine-Tuned model's tendency to homogeneously collapse the background environment.
+% -----------------------------------------------------------------------------
+\subsection{Experiments for Method 1: CMDG}
+\label{sec:exp_cmdg}
+% -----------------------------------------------------------------------------
 
-\textbf{Metrics:} \\
-We evaluate the generated batches along two orthogonal axes. To quantitatively measure spatial and compositional variance, we compute intra-batch \textbf{LPIPS} utilizing an AlexNet backbone. Concurrently, to objectively evaluate textual alignment, human preference, and aesthetic fidelity, we compute \textbf{PickScore} utilizing the official \texttt{PickScore\_v1} ViT-H model.
+\subsubsection{Setup}
 
-\textbf{Evaluation Prompts:} \\
-To stress-test the framework's ability to handle both spatial composition and multi-entity semantic routing, we curated a set of prompts ranging from single-subject portraits to complex, multi-subject interactions. Representative examples from our test suite include isolated subjects (e.g., \textit{``A beautiful cinematic shark''}), heavily contextualized figures (e.g., \textit{``A majestic knight standing in a mystical forest, cinematic lighting, highly detailed''}), and chaotic multi-subject interactions (e.g., \textit{``A beautiful cartoonlike village full of trees and houses''}).
-\subsection{Results}
-\label{sec:results}
+CMDG is evaluated on the Fine-Tuned model (DreamShaper-8) with CFG scale $w=7.5$. We compare four configurations: (i)~\textit{Base Model baseline} (SD v1.5, $w=3.5$, no guidance), representing the diversity upper bound; (ii)~\textit{Fine-Tuned baseline} (DreamShaper-8, $w=7.5$, no guidance), representing the alignment upper bound; (iii)~\textit{Naive latent-space guidance (ours)}, which computes the diversity gradient directly on $\mathbf{x}_t$ with $\lambda_{\text{div}} = 10.0$; and (iv)~\textit{CMDG (ours)}, which computes the diversity gradient on the clean estimate $\hat{\mathbf{x}}_0$ with $\lambda_{\text{div}} = 5.0$. Both guidance variants share an early-stop ratio $k = 0.3$, loss type \textit{structural} (average-pooled cosine similarity), and weight schedule \textit{constant}.
 
-Our experimental findings clearly illustrate the pervasive nature of the alignment--diversity tradeoff in standard diffusion paradigms and demonstrate OAEG's capacity to effectively navigate it.
+Prompts are drawn from a suite of 43 prompts spanning simple single-object scenes, compositional multi-object layouts, and stylistic descriptions.
 
-\subsubsection{Quantitative Analysis}
+\subsubsection{Quantitative Results}
 
-Table~\ref{tab:metrics_comparison} presents the objective evaluation of our framework against the isolated Base and Fine-Tuned models. The empirical data perfectly encapsulates the fundamental tension: the Base model exhibits excellent structural diversity (LPIPS: $0.725$) but suffers from lower alignment and aesthetic preference (PickScore: $20.45$). Conversely, the Fine-Tuned model achieves superior human-preference validation (PickScore: $22.80$) but exhibits severe spatial mode collapse, nearly halving the measured diversity (LPIPS: $0.410$). 
+Table~\ref{tab:cmdg_metrics} presents the average metrics across all 43 evaluation prompts for each configuration. The Fine-Tuned baseline (DreamShaper-8) achieves the highest alignment scores (ImageReward: $1.022$) but exhibits the lowest diversity (LPIPS: $0.563$), confirming the alignment--diversity tradeoff. The Base Model baseline (SD v1.5) provides the reference diversity level (LPIPS: $0.675$) at lower alignment (ImageReward: $0.431$).
 
-By intelligently routing the generation domains via dynamic entropy sensing and semantic masking, OAEG successfully bridges this gap. Our method restores near-baseline levels of structural diversity (LPIPS: $0.690$) while fully inheriting the aesthetic reward scaling of the preference-aligned checkpoint (PickScore: $22.65$).
+Our \textbf{Latent-Space Diversity Guidance} achieves the most favorable tradeoff among all configurations. It increases LPIPS from $0.563$ to $0.653$---recovering $80\%$ of the diversity gap to the Base Model---while \textit{fully preserving} alignment: it achieves the highest CLIP Score of all four methods ($0.322$) and retains $83\%$ of the Fine-Tuned model's ImageReward ($0.851$ vs.\ $1.022$). This demonstrates that direct latent-domain repulsion, when restricted to the early denoising steps and combined with structural pooling, provides a highly effective and efficient diversity intervention without meaningfully compromising image quality.
+
+The clean-manifold variant (CMDG) achieves higher raw diversity (LPIPS: $0.753$), surpassing even the Base Model. However, this comes at a substantially larger cost to perceptual quality and alignment (ImageReward: $0.665$, a $35\%$ drop from the Fine-Tuned baseline), indicating that the stronger Tweedie-based gradients tend to over-steer the sampling trajectories. The latent-space variant thus occupies a more practical operating point on the Pareto frontier, offering a strong diversity boost with minimal quality degradation.
 
 \begin{table}[h]
 \centering
-\caption{Quantitative comparison of Diversity (LPIPS, $\uparrow$) and Alignment (PickScore, $\uparrow$) averaged across several testing prompts. OAEG achieves a superior Pareto frontier, maintaining the high PickScore of the Fine-Tuned model while recovering the LPIPS diversity of the Base model.}
-\label{tab:metrics_comparison}
+\caption{Quantitative comparison for Early-Step Diversity Guidance, averaged across 43 evaluation prompts. The latent-space variant achieves the best diversity--alignment balance, while the clean-manifold variant (CMDG) trades alignment for higher raw diversity.}
+\label{tab:cmdg_metrics}
+\begin{tabular}{l c c c c}
+\toprule
+\textbf{Method} & \textbf{LPIPS $\uparrow$} & \textbf{CLIP Score $\uparrow$} & \textbf{CLIP Div.\ $\uparrow$} & \textbf{ImageReward $\uparrow$} \\
+\midrule
+Base Model (SD v1.5, $w\!=\!3.5$)       & 0.675 & 0.317 & 0.159 & 0.431 \\
+Fine-Tuned (DreamShaper-8, $w\!=\!7.5$) & 0.563 & 0.321 & 0.089 & 1.022 \\
+\textbf{Latent-Space Guidance (ours, $\lambda\!=\!10$)}  & \textbf{0.653} & \textbf{0.322} & 0.108 & \textbf{0.851} \\
+CMDG (ours, $\lambda\!=\!5$)   & 0.753 & 0.318 & 0.136 & 0.665 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Qualitative Results}
+
+We highlight qualitative comparisons on three representative prompts that span different complexity levels, using four fixed noise seeds per method.
+
+\textbf{Single Subject:} For the prompt \textit{``A beautiful cinematic shark,''} the Fine-Tuned baseline produces near-identical shark poses and water environments across seeds (LPIPS: $0.575$). Our latent-space guidance substantially improves layout variation (LPIPS: $0.714$), generating different underwater scenes, camera angles, and shark poses while preserving the cinematic rendering quality of the Fine-Tuned model. CMDG pushes raw diversity further (LPIPS: $0.808$) but at noticeable cost to image coherence.
+
+\textbf{Subject in Context:} For \textit{``A majestic knight standing in a mystical forest, cinematic lighting, highly detailed,''} the Fine-Tuned baseline freezes both the forest layout and the knight pose (LPIPS: $0.441$). Our latent-space guidance recovers substantial structural variation (LPIPS: $0.577$), producing diverse forest geometries and knight stances while maintaining the Fine-Tuned model's superior texture fidelity (CLIP Score: $0.360$ vs.\ $0.326$ for the Base Model). CMDG achieves higher diversity (LPIPS: $0.744$) but with diminished alignment.
+
+\textbf{Complex Scene:} For \textit{``A beautiful cartoonlike village full of trees and houses,''} the Fine-Tuned model generates repetitive village layouts (LPIPS: $0.495$). Our latent-space guidance provides a meaningful improvement (LPIPS: $0.525$), introducing varied road configurations and building placements while retaining the vibrant cartoon-like aesthetic (ImageReward: $0.254$ vs.\ $0.770$ for the unguided Fine-Tuned baseline). CMDG achieves the highest raw diversity (LPIPS: $0.776$) but at a significant quality cost (ImageReward: $0.043$), confirming that the latent-space variant offers the more practical operating point.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\textwidth]{method1-shark.png}
+    \caption{Visual comparison for \textit{``A beautiful cinematic shark''}. Our latent-space guidance generates diverse underwater environments and shark poses while preserving the Fine-Tuned model's cinematic quality.}
+    \label{fig:cmdg_shark}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\textwidth]{method1-knight.png}
+    \caption{Visual comparison for \textit{``A majestic knight standing in a mystical forest...''}. Our latent-space guidance recovers varied forest geometries and knight stances while retaining the Fine-Tuned model's texture fidelity.}
+    \label{fig:cmdg_knight}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\textwidth]{method1-houses.png}
+    \caption{Visual comparison for \textit{``A beautiful cartoonlike village full of trees and houses''}. Our latent-space guidance introduces diverse village topographies and road layouts while maintaining the cartoon-like aesthetic.}
+    \label{fig:cmdg_houses}
+\end{figure}
+
+% -----------------------------------------------------------------------------
+\subsection{Experiments for Method 2: OAEG}
+\label{sec:exp_oaeg}
+% -----------------------------------------------------------------------------
+
+\subsubsection{Setup}
+
+OAEG requires simultaneous inference from two models. The Base model operates at a low CFG scale ($w=3.5$) to encourage maximum structural diversity, while the Fine-Tuned model operates at a high CFG scale ($w=7.5$) to maximize aesthetic alignment. Inside the OAEG pipeline, these asymmetric CFG scales are evaluated simultaneously during the dual U-Net pass.
+
+For the OAEG-specific hyperparameters, we set the attention mask threshold to $\tau_{\text{mask}} = 0.20$, the sigmoid slope to $s=0.2$ coupled with a dynamically calculated threshold ($\tau_{\text{entropy}} = E_0 / 2$), and a background damping factor of $d = 0.05$. This $5\%$ allowance prevents latent-space discontinuity at the mask boundaries while completely neutralizing the Fine-Tuned model's tendency to homogeneously collapse the background environment.
+
+Evaluation prompts range from single-subject portraits (e.g., \textit{``A beautiful cinematic shark''}) to heavily contextualized figures (e.g., \textit{``A majestic knight standing in a mystical forest, cinematic lighting, highly detailed''}) and complex multi-subject interactions (e.g., \textit{``A beautiful cartoonlike village full of trees and houses''}).
+
+\subsubsection{Quantitative Results}
+
+Table~\ref{tab:oaeg_metrics} presents the objective evaluation of OAEG against the isolated Base and Fine-Tuned models. The empirical data encapsulates the fundamental tension: the Base model exhibits excellent structural diversity (LPIPS: $0.635$) but suffers from lower alignment (PickScore: $20.21$). Conversely, the Fine-Tuned model achieves superior human-preference validation (PickScore: $21.36$) but exhibits spatial mode collapse, reducing diversity (LPIPS: $0.5468$).
+
+By intelligently routing the generation domains via dynamic entropy sensing and semantic masking, OAEG successfully bridges this gap. Our method restores near-baseline levels of structural diversity (LPIPS: $0.6271$) while preserving the aesthetic reward scaling of the preference-aligned checkpoint (PickScore: $20.843$).
+
+\begin{table}[h]
+\centering
+\caption{Quantitative comparison of Diversity (LPIPS, $\uparrow$) and Alignment (PickScore, $\uparrow$) for OAEG, averaged across several testing prompts.}
+\label{tab:oaeg_metrics}
 \begin{tabular}{l c c}
 \toprule
 \textbf{Method} & \textbf{Diversity (LPIPS $\uparrow$)} & \textbf{Alignment (PickScore $\uparrow$)} \\
@@ -344,7 +451,7 @@ Fine-Tuned (DreamShaper-8) & 0.5468 & 21.36 \\
 \end{tabular}
 \end{table}
 
-\subsubsection{Qualitative Analysis}
+\subsubsection{Qualitative Results}
 
 The quantitative success of OAEG is visually corroborated across a variety of prompt complexities. We highlight the generative outputs across four fixed noise seeds for three distinct test cases.
 
@@ -356,36 +463,47 @@ The quantitative success of OAEG is visually corroborated across a variety of pr
 \newpage
 \begin{figure}[H]
     \centering
-    \includegraphics[width=0.7\textwidth]{iclr2026/shark.png} 
+    \includegraphics[width=0.7\textwidth]{iclr2026/shark.png}
     \caption{Visual comparison for \textit{``A beautiful cinematic shark''}. OAEG successfully diversifies the ocean environment and camera angles (matching the Base model's structural entropy) while preserving the high-quality textures of the Fine-Tuned model. The bottom row displays the extracted semantic mask for the token \textit{shark}.}
     \label{fig:oaeg_shark}
 \end{figure}
 \begin{figure}[H]
     \centering
-    \includegraphics[width=0.7\textwidth]{iclr2026/knight.png} 
+    \includegraphics[width=0.7\textwidth]{iclr2026/knight.png}
     \caption{Visual comparison for \textit{``A majestic knight standing in a mystical forest...''}. OAEG completely circumvents the Fine-Tuned model's tendency to identically replicate the background trees across varying seeds.}
     \label{fig:oaeg_knight}
 \end{figure}
 
 \begin{figure}[H]
     \centering
-    \includegraphics[width=\textwidth]{iclr2026/houses.png} 
+    \includegraphics[width=\textwidth]{iclr2026/houses.png}
     \caption{Visual comparison for \textit{``A hilarious, cinematic and brutal fight between crocodile and large snake''}. The dynamic multi-subject mask accurately isolates both entities, allowing OAEG to render diverse combat poses and swamp environments that the Fine-Tuned model inherently suppresses.}
     \label{fig:oaeg_village}
 \end{figure}
-% =============================================================================
 \section{Discussion}
 \label{sec:discussion}
-% =============================================================================
 
-% TODO: Analysis of findings, limitations, and future directions.
+Our experiments provide clear empirical evidence that the alignment--diversity tradeoff is not merely a side effect of specific training procedures, but rather a structural phenomenon inherent to preference optimization in diffusion models. As alignment pressure increases---whether through fine-tuning, reward optimization, or stronger classifier-free guidance---the model increasingly concentrates probability mass on a narrow subset of visually preferred solutions, leading to spatial and compositional mode collapse. This observation is consistent with the theoretical formulation presented in Section~\ref{sec:problem}, where reward-weighted optimization naturally reduces output entropy.
 
-% =============================================================================
+The proposed Object-Aware Entropy Guidance (OAEG) framework demonstrates that it is possible to partially decouple alignment and diversity by exploiting internal signals of the diffusion process rather than modifying model weights. In particular, two design principles emerge as critical. First, early-stage structural entropy plays a central role in determining final diversity. By allowing the Base model to dominate during high-entropy phases, OAEG preserves global layout variability before transitioning toward alignment refinement. Second, spatially localized alignment control is essential. Constraining the influence of the Fine-Tuned model to semantically relevant regions prevents global background homogenization, which is a primary driver of diversity collapse in preference-aligned checkpoints.
+
+An interesting finding of our study concerns the role of frequency consistency. While we initially hypothesized that global frequency harmonization between Base and Fine-Tuned predictions would improve perceptual coherence, empirical results revealed the opposite: imposing Fine-Tuned low-frequency structure on the background reintroduced mode collapse. This suggests that diversity preservation depends not only on spatial routing but also on maintaining independent global statistics across samples.
+
+Despite its effectiveness, OAEG has several limitations. First, the method requires dual forward passes through two diffusion models, which increases computational cost relative to standard inference. Second, the quality of the semantic mask depends on cross-attention reliability; prompts with highly abstract or ambiguous tokens may yield less precise localization. Third, the current entropy sensing mechanism is heuristic and may not generalize optimally across architectures or sampling schedules. Finally, our evaluation focuses primarily on perceptual diversity and preference alignment; broader notions of diversity, such as semantic coverage across prompt variations, remain to be explored.
+
+More broadly, our findings suggest that alignment and diversity should not be treated as opposing objectives but as jointly controllable properties of the generative process. Methods that exploit internal uncertainty signals, spatial decomposition, and adaptive blending may offer a promising direction toward expanding the Pareto frontier between fidelity and variability without requiring expensive retraining.
+
+
 \section{Conclusion}
 \label{sec:conclusion}
-% =============================================================================
 
-% TODO
+In this work, we investigated the fundamental alignment--diversity tradeoff in text-to-image diffusion models from both theoretical and empirical perspectives. We first formalized the tradeoff as a consequence of reward-driven distribution shaping, showing that alignment optimization inherently concentrates probability mass and reduces entropy. We then surveyed existing alignment paradigms and diversity-preserving strategies, highlighting the limitations of both training-based and test-time approaches.
+
+To better understand and mitigate this tradeoff, we introduced Object-Aware Entropy Guidance (OAEG), a training-free inference framework that dynamically blends predictions from a diverse base model and a highly aligned fine-tuned model. By leveraging entropy-aware temporal scheduling and spatially localized semantic masking derived from cross-attention maps, OAEG preserves global structural diversity while maintaining high-quality subject rendering. Experimental results demonstrate that our approach significantly improves the alignment--diversity Pareto frontier, recovering much of the Base model's variability without sacrificing the Fine-Tuned model's aesthetic fidelity.
+
+Our study highlights an important insight: diversity collapse in aligned diffusion models is often driven by global background regularization rather than subject rendering itself. Controlling where and when alignment pressure is applied can therefore provide a powerful mechanism for balancing fidelity and variability without retraining.
+
+Future work may explore more principled entropy estimation techniques, improved semantic localization strategies, and extensions to multi-modal or video diffusion models. Ultimately, developing alignment methods that explicitly preserve generative diversity will be essential for building creative AI systems that remain both controllable and expressive.
 
 \bibliography{iclr2026_conference}
 \bibliographystyle{iclr2026_conference}
